@@ -7,15 +7,21 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
+import socket
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
+import google_auth_httplib2
+import httplib2
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import Resource, build
+from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload
 from tqdm.auto import tqdm
 
@@ -23,7 +29,7 @@ FOLDER_MIME = "application/vnd.google-apps.folder"
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 
 
-def drive_service(credentials_path: Path, token_path: Path) -> Resource:
+def drive_service(credentials_path: Path, token_path: Path, http_timeout: int) -> Resource:
     """Open browser OAuth on first run and reuse the refresh token later."""
     if not credentials_path.is_file():
         raise SystemExit(f"Không thấy {credentials_path}. Hãy tạo OAuth Desktop credentials rồi tải JSON về tên này.")
@@ -36,7 +42,27 @@ def drive_service(credentials_path: Path, token_path: Path) -> Resource:
         else:
             credentials = InstalledAppFlow.from_client_secrets_file(credentials_path, SCOPES).run_local_server(port=0)
         token_path.write_text(credentials.to_json(), encoding="utf-8")
-    return build("drive", "v3", credentials=credentials)
+    # Drive can take a while to enumerate/download a large medical archive.
+    # The default socket timeout is too short for an unstable connection.
+    http = google_auth_httplib2.AuthorizedHttp(credentials, http=httplib2.Http(timeout=http_timeout))
+    return build("drive", "v3", http=http, cache_discovery=False)
+
+
+def execute_with_retry(request: Any, operation: str, attempts: int = 6) -> Any:
+    """Retry transient Drive/network failures with bounded exponential backoff."""
+    retryable_statuses = {408, 429, 500, 502, 503, 504}
+    for attempt in range(attempts):
+        try:
+            return request.execute()
+        except HttpError as exc:
+            if exc.resp.status not in retryable_statuses or attempt == attempts - 1:
+                raise
+        except (TimeoutError, socket.timeout, ConnectionError, OSError):
+            if attempt == attempts - 1:
+                raise
+        delay = min(30, 2 ** attempt) + random.uniform(0, 1)
+        print(f"{operation} gặp lỗi tạm thời; thử lại sau {delay:.1f}s ({attempt + 1}/{attempts - 1})")
+        time.sleep(delay)
 
 
 def list_children(service: Resource, parent_id: str) -> list[dict[str, Any]]:
@@ -44,11 +70,12 @@ def list_children(service: Resource, parent_id: str) -> list[dict[str, Any]]:
     children: list[dict[str, Any]] = []
     page_token: str | None = None
     while True:
-        response = service.files().list(
+        request = service.files().list(
             q=f"'{parent_id}' in parents and trashed = false", spaces="drive",
             fields="nextPageToken, files(id,name,mimeType,md5Checksum,size,modifiedTime)",
             pageToken=page_token, pageSize=1000, orderBy="folder,name",
-        ).execute()
+        )
+        response = execute_with_retry(request, "Đọc danh sách folder Drive")
         children.extend(response.get("files", []))
         page_token = response.get("nextPageToken")
         if not page_token:
@@ -79,14 +106,26 @@ def load_manifest(path: Path) -> dict[str, dict[str, str]]:
         return {}
 
 
-def download_file(service: Resource, item: dict[str, Any], target: Path) -> None:
+def download_file(service: Resource, item: dict[str, Any], target: Path, attempts: int = 6) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
-    request = service.files().get_media(fileId=item["id"])
-    with target.open("wb") as output:
-        downloader = MediaIoBaseDownload(output, request)
-        done = False
-        while not done:
-            _, done = downloader.next_chunk()
+    for attempt in range(attempts):
+        try:
+            request = service.files().get_media(fileId=item["id"])
+            with target.open("wb") as output:
+                downloader = MediaIoBaseDownload(output, request)
+                done = False
+                while not done:
+                    _, done = downloader.next_chunk()
+            return
+        except HttpError as exc:
+            if exc.resp.status not in {408, 429, 500, 502, 503, 504} or attempt == attempts - 1:
+                raise
+        except (TimeoutError, socket.timeout, ConnectionError, OSError):
+            if attempt == attempts - 1:
+                raise
+        delay = min(30, 2 ** attempt) + random.uniform(0, 1)
+        print(f"Tải lại {item['name']} sau {delay:.1f}s ({attempt + 1}/{attempts - 1})")
+        time.sleep(delay)
 
 
 def cache_tree(service: Resource, root_id: str, destination: Path, label: str) -> Path:
@@ -105,14 +144,21 @@ def cache_tree(service: Resource, root_id: str, destination: Path, label: str) -
             else:
                 files.append((item, local_path))
 
-    for item, target in tqdm(files, desc=f"Tải {label}"):
-        fingerprint = item.get("md5Checksum") or item.get("modifiedTime", "")
-        cached = old_manifest.get(item["id"], {})
-        if not (target.is_file() and cached.get("fingerprint") == fingerprint):
-            download_file(service, item, target)
-        new_manifest[item["id"]] = {"path": str(target.relative_to(destination)), "fingerprint": fingerprint}
-    manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    manifest_path.write_text(json.dumps(new_manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    try:
+        for index, (item, target) in enumerate(tqdm(files, desc=f"Tải {label}"), start=1):
+            fingerprint = item.get("md5Checksum") or item.get("modifiedTime", "")
+            cached = old_manifest.get(item["id"], {})
+            if not (target.is_file() and cached.get("fingerprint") == fingerprint):
+                download_file(service, item, target)
+            new_manifest[item["id"]] = {"path": str(target.relative_to(destination)), "fingerprint": fingerprint}
+            # Preserve progress without rewriting the manifest for every file.
+            if index % 100 == 0:
+                manifest_path.parent.mkdir(parents=True, exist_ok=True)
+                manifest_path.write_text(json.dumps(new_manifest, ensure_ascii=False), encoding="utf-8")
+    finally:
+        # An interruption will at worst repeat the last incomplete batch.
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(json.dumps(new_manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     return destination
 
 
@@ -125,9 +171,10 @@ def main() -> None:
     parser.add_argument("--cache", default=".drive_cache", help="Reusable local download cache")
     parser.add_argument("--output", default="mapping_output", help="Folder for mapping CSVs")
     parser.add_argument("--threshold", type=int, default=10)
+    parser.add_argument("--http-timeout", type=int, default=180, help="Seconds before one Drive request times out")
     args = parser.parse_args()
 
-    service = drive_service(Path(args.credentials), Path(args.token))
+    service = drive_service(Path(args.credentials), Path(args.token), args.http_timeout)
     images_id = resolve_folder(service, args.images_drive_path)
     reports_id = resolve_folder(service, args.reports_drive_path)
     cache = Path(args.cache)
