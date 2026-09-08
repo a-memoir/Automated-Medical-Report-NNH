@@ -1,6 +1,33 @@
 .DS_Store
 __pycache__/
+.ipynb_checkpoints/
+
+# Credentials / local caches
 credentials.json
 token.json
 .drive_cache/
+
+# Local / Drive dataset outputs
 mapping_output/
+NoiSoi_Matching/
+
+# Clinical source data — never commit patient data
+*.pdf
+*.jpg
+*.jpeg
+*.png
+*.webp
+*.dcm
+*.nii
+*.nii.gz
+
+# Generated tabular data / checkpoints
+*.csv
+*.parquet
+*.pkl
+*.pickle
+
+# Local environment
+.env
+.venv/
+venv/
