@@ -2,9 +2,9 @@
 
 An ongoing research project for **automated medical report generation from ENT (Ear, Nose and Throat) endoscopy images**.
 
-The long-term goal is to build a system that takes endoscopy images together with relevant patient/context information and generates a structured Vietnamese medical report. The project is currently focused on **dataset preparation and reliable image-to-report mapping** before model development.
+The long-term goal is to build a system that takes endoscopy images together with relevant patient/context information and generates a structured Vietnamese medical report. The project is currently focused on **dataset preparation, reliable image-to-report mapping, patient identity cleaning, and leakage prevention** before model development.
 
-> **Status:** Dataset V1.2 baseline completed. Model development has not started yet.
+> **Status:** Dataset V1.2 baseline completed; final patient-identity cleaning completed. Model development has not started yet.
 
 ## Project goal
 
@@ -33,7 +33,7 @@ The target report is expected to contain structured sections such as:
 - Differential diagnosis, when applicable
 - Recommendations
 
-The exact model architecture will be selected only after the underlying image/report pairs have been reliably constructed.
+The exact model architecture will be selected only after the underlying image/report pairs have been reliably constructed and leakage has been checked.
 
 ## Current dataset
 
@@ -186,7 +186,7 @@ Parser validation identified and corrected support for an English-language repor
 
 Dataset V1.2 combines the trusted metadata from the original structured parser with the corrected section parser while preserving the original image ↔ case ↔ PDF mapping.
 
-Final baseline:
+Final baseline before patient-level cleaning:
 
 - **7,607 cases**
 - **76,405 images**
@@ -213,16 +213,58 @@ dataset_v1_2_images.csv
 dataset_v1_2_quality_audit.csv
 ```
 
+### 10. Patient identity and gender cleaning — completed
+
+Patient identity is now defined using a deliberately simple and reproducible rule:
+
+> **Same normalized full name + same birth year = same patient.**
+
+The identity key is stored as:
+
+```text
+patient_group_id = normalized_name + "_" + birth_year
+```
+
+`case_id` remains the unit of an individual examination / image case, while `patient_group_id` groups multiple examinations belonging to the same patient.
+
+Final identity-cleaned dataset:
+
+- **7,607 cases**
+- **3,072 patient groups**
+- **1,406 patient groups with ≥2 cases**
+- Largest patient group: **43 cases**
+- **0 cases missing patient identity**
+- **0 duplicate case IDs**
+
+Gender cleaning was performed separately from patient identity. Previous majority-based and manual corrections were retained, with additional clearly female names manually corrected. Gender is therefore treated as a case-level field with documented correction provenance rather than being used to construct patient identity.
+
+Final gender distribution:
+
+- **3,955 NAM**
+- **3,652 NỮ**
+
+There are currently **45 patient groups with conflicting gender values across 251 cases**. These conflicts are retained for audit rather than being automatically overwritten without additional evidence.
+
+Final cleaned file:
+
+```text
+dataset_v1_2_cases_final_clean.csv
+gender_conflicts_final_clean.csv
+```
+
+This patient-level identity key will be used for leakage-safe dataset splitting. All cases belonging to the same `patient_group_id` must remain in the same train, validation, or test split.
+
 ## Current next steps
 
 The dataset is now ready for the next validation stage before model development:
 
-1. Check for duplicate / near-duplicate images across different cases.
-2. Freeze the case-level dataset split.
-3. Create train / validation / test splits **by case_id**, not by individual image.
-4. Check for train/test leakage.
-5. Establish a baseline multimodal model.
-6. Evaluate report generation and factual consistency.
+1. Check for exact duplicate images across different cases.
+2. Check for near-duplicate images across different cases.
+3. Investigate potential image-level leakage across patient/case groups.
+4. Freeze the patient-level dataset split using `patient_group_id`.
+5. Create train / validation / test splits with no patient overlap.
+6. Establish a baseline multimodal model.
+7. Evaluate report generation and factual consistency.
 
 ## Repository structure
 
